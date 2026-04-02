@@ -1,91 +1,70 @@
-import os
 import pandas as pd
 import numpy as np
+import os
+import plotly.graph_objects as go
 
-# ===============================
+# =========================================
 # CONFIG
-# ===============================
+# =========================================
 
-DATA_FOLDER = "features"
-OUTPUT_FILE = "triple_barrier_dataset.csv"
-
-RUN_FILE_KEY = "run_bars"
+DATA_FOLDER = "full_features"
+RUN_FILE = "BTCUSDT_run_bars_features.csv"
 
 PT_MULT = 1.5
 SL_MULT = 1.0
 MAX_HORIZON = 50
-MIN_PROB = 0.55
 
-# ===============================
-# HELPERS
-# ===============================
+OUTPUT_FILE = "triple_barrier_dataset.csv"
 
-def clean_features(df):
-    valid_cols = []
+# =========================================
+# LOAD DATA
+# =========================================
 
-    for col in df.columns:
-        if col == "datetime":
-            valid_cols.append(col)
-            continue
+def load_data(folder):
 
-        if df[col].iloc[60:].notna().sum() > 0:
-            valid_cols.append(col)
+    files = [f for f in os.listdir(folder) if f.endswith(".csv")]
 
-    return df[valid_cols]
+    dfs = {}
 
+    for f in files:
 
-def load_all_feature_files(folder):
-    feature_dfs = {}
-    run_df = None
-
-    for file in os.listdir(folder):
-
-        if not file.endswith(".csv"):
-            continue
-
-        path = os.path.join(folder, file)
+        path = os.path.join(folder, f)
         df = pd.read_csv(path)
 
-        if "datetime" not in df.columns:
-            continue
+        df["datetime"] = pd.to_datetime(df["datetime"], format="mixed")
+        df = df.sort_values("datetime")
 
-        df["datetime"] = pd.to_datetime(
-            df["datetime"],
-            format="mixed",
-            errors="coerce"
-        )
+        dfs[f] = df
 
-        if RUN_FILE_KEY in file:
-            run_df = df.copy()
-        else:
-            feature_dfs[file] = df.copy()
+    return dfs
 
-    return run_df, feature_dfs
 
+# =========================================
+# MERGE (CRÍTICO)
+# =========================================
 
 def merge_features(run_df, feature_dfs):
 
-    merged = run_df.sort_values("datetime").copy()
+    merged = run_df.copy()
 
-    for name, df_feat in feature_dfs.items():
+    for name, df in feature_dfs.items():
 
-        df_feat = clean_features(df_feat)
-        df_feat = df_feat.sort_values("datetime")
+        if name == RUN_FILE:
+            continue
 
-        # 🔥 CRÍTICO: prefixo único baseado no nome do arquivo
-        prefix = name.replace(".csv", "").replace("_features", "")
+        df = df.sort_values("datetime")
 
-        rename_cols = {
-            col: f"{prefix}__{col}"
-            for col in df_feat.columns
-            if col != "datetime"
-        }
+        # remove colunas OHLC duplicadas
+        drop_cols = ["open", "high", "low", "close"]
+        df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
 
-        df_feat = df_feat.rename(columns=rename_cols)
+        # prefixo para evitar conflito
+        df = df.add_prefix(f"{name}__")
+        df.rename(columns={f"{name}__datetime": "datetime"}, inplace=True)
 
         merged = pd.merge_asof(
             merged,
-            df_feat,
+            df,
             on="datetime",
             direction="backward"
         )
@@ -93,159 +72,383 @@ def merge_features(run_df, feature_dfs):
     return merged
 
 
+# =========================================
+# BUILD EVENTS (RUN BARS)
+# =========================================
+
 def build_events(df):
+
+    df = df.copy()
+
+    # ===============================
+    # GARANTIR ROLLING HIGH
+    # ===============================
+
+    if "rolling_high" not in df.columns:
+        df["rolling_high"] = df["high"].rolling(20).max()
+
+    # ===============================
+    # SINAL DE BREAKOUT
+    # ===============================
+
+    df["breakout"] = df["high"] > df["rolling_high"].shift(1)
+
+    # ===============================
+    # GERAR EVENTOS
+    # ===============================
 
     events = []
 
     for i in range(len(df) - 1):
 
-        t0 = df.loc[i, "datetime"]
-        entry_price = df.loc[i+1, "open"]
+        # só entra se houver breakout
+        if not df.loc[i, "breakout"]:
+            continue
 
-        events.append({
-            "t0": t0,
-            "entry_price": entry_price,
-            "index": i
-        })
+        # evitar NaN (início da série)
+        if pd.isna(df.loc[i, "rolling_high"]):
+            continue
 
-    return pd.DataFrame(events)
+        event = {
+            "t0": df.loc[i, "datetime"],
+            "index": int(i),
+            "entry_price": df.loc[i, "rolling_high"]
+        }
 
-def estimate_prob_success(df, idx, entry_price):
+        events.append(event)
 
-    row = df.loc[idx]
+    events_df = pd.DataFrame(events)
 
-    # ===== FEATURES CHAVE =====
-    momentum = row.get("run_bars__momentum_10", 0)
-    volatility = row.get("run_bars__volatility", 0)
-    range_exp = row.get("run_bars__range_expansion", 1)
-    trend = row.get("run_bars__trend_strength", 0)
+    print(f"Eventos gerados: {len(events_df)}")
 
-    # ===== PRICE COMPONENT =====
-    move = (row["close"] - entry_price) / entry_price
-
-    # ===== SCORE =====
-    score = (
-        2.0 * move +           # direção
-        0.5 * momentum +       # persistência
-        0.3 * trend -          # regime
-        0.7 * range_exp -      # exaustão (importante!)
-        0.2 * volatility       # ruído
-    )
-
-    # squash → probabilidade
-    prob = 1 / (1 + np.exp(-5 * score))
-
-    return prob
+    return events_df
 
 
-def triple_barrier_adaptive(
-    df,
-    events,
-    pt_mult=1.5,
-    sl_mult=1.0,
-    max_horizon=50,
-    min_prob=0.55
-):
+# =========================================
+# TRIPLE BARRIER
+# =========================================
+
+def triple_barrier(df, events):
 
     labels = []
     exit_prices = []
+    exit_indices = []
+    exit_times = []
+
+    # ===============================
+    # GARANTIR VOLATILIDADE
+    # ===============================
+
+    if "volatility" not in df.columns:
+        df["volatility"] = df["close"].pct_change().rolling(20).std()
 
     for _, ev in events.iterrows():
 
         idx = int(ev["index"])
         entry_price = ev["entry_price"]
 
-        vol = df.loc[idx, "volatility"] if "volatility" in df.columns else 0.001
+        # proteção contra NaN / zero
+        vol = df.loc[idx, "volatility"]
+        if pd.isna(vol) or vol <= 0:
+            vol = 1e-4
 
-        pt = entry_price * (1 + pt_mult * vol)
-        sl = entry_price * (1 - sl_mult * vol)
+        # ===============================
+        # DEFINIÇÃO DAS BARREIRAS
+        # ===============================
 
-        prob_path = []
+        pt = entry_price * (1 + PT_MULT * vol)
+        sl = entry_price * (1 - SL_MULT * vol)
+
         label = 0
+        exit_index = None
         exit_price = entry_price
 
-        for j in range(1, max_horizon):
+        # ===============================
+        # LOOP FUTURO
+        # ===============================
 
-            if idx + j >= len(df):
+        for j in range(1, MAX_HORIZON + 1):
+
+            i_exit = idx + j
+
+            if i_exit >= len(df):
                 break
 
-            price = df.loc[idx + j, "close"]
+            high = df.loc[i_exit, "high"]
+            low = df.loc[i_exit, "low"]
 
-            if price >= pt:
+            # ===============================
+            # TAKE PROFIT (usa HIGH)
+            # ===============================
+
+            if high >= pt:
                 label = 1
-                exit_price = price
+                exit_index = i_exit
+                exit_price = df.loc[i_exit, "open"]
                 break
 
-            if price <= sl:
+            # ===============================
+            # STOP LOSS (usa LOW)
+            # ===============================
+
+            if low <= sl:
                 label = -1
-                exit_price = price
+                exit_index = i_exit
+                exit_price = df.loc[i_exit, "open"]
                 break
 
-            prob_success = estimate_prob_success(df, idx + j, entry_price)
-            prob_path.append(prob_success)
+        # ===============================
+        # FALLBACK (TIME BARRIER)
+        # ===============================
 
-            if len(prob_path) > 5:
-                if len(prob_path) > 5:
-
-                    recent_trend = prob_path[-1] - np.mean(prob_path[-5:])
-
-                    if prob_path[-1] < min_prob or recent_trend < -0.05:
-                        label = 0
-                        exit_price = price
-                        break
+        if exit_index is None:
+            exit_index = min(idx + MAX_HORIZON, len(df) - 1)
+            exit_price = df.loc[exit_index, "open"]
+            label = 0
 
         labels.append(label)
         exit_prices.append(exit_price)
+        exit_indices.append(exit_index)
+        exit_times.append(df.loc[exit_index, "datetime"])
 
     events["label"] = labels
     events["exit_price"] = exit_prices
+    events["exit_index"] = exit_indices
+    events["t1"] = exit_times
 
     return events
 
+def plot_last_trades(df, n_trades=100):
 
-# ===============================
+    import plotly.graph_objects as go
+    import numpy as np
+    import pandas as pd
+
+    # ===============================
+    # GARANTIR TIPOS CORRETOS
+    # ===============================
+
+    df = df.copy()
+
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    df["t0"] = pd.to_datetime(df["t0"], errors="coerce")
+    df["t1"] = pd.to_datetime(df["t1"], errors="coerce")
+
+    # índices podem vir como float
+    df["index"] = pd.to_numeric(df["index"], errors="coerce")
+    df["exit_index"] = pd.to_numeric(df["exit_index"], errors="coerce")
+
+    # ===============================
+    # FILTRAR TRADES VÁLIDOS
+    # ===============================
+
+    df_trades = df.dropna(subset=["index", "exit_index", "entry_price", "exit_price"]).copy()
+
+    df_trades["index"] = df_trades["index"].astype(int)
+    df_trades["exit_index"] = df_trades["exit_index"].astype(int)
+
+    df_trades = df_trades.tail(n_trades)
+
+    if len(df_trades) == 0:
+        print("Nenhum trade válido para plot.")
+        return
+
+    # ===============================
+    # DEFINIR JANELA DE PLOT
+    # ===============================
+
+    start_idx = int(df_trades["index"].min())
+    end_idx = int(df_trades["exit_index"].max())
+
+    # proteção contra out-of-bounds
+    start_idx = max(0, start_idx)
+    end_idx = min(len(df) - 1, end_idx)
+
+    df_plot = df.iloc[start_idx:end_idx + 1].copy()
+
+    # ===============================
+    # CANDLESTICK
+    # ===============================
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Candlestick(
+        x=df_plot["datetime"],
+        open=df_plot["open"],
+        high=df_plot["high"],
+        low=df_plot["low"],
+        close=df_plot["close"],
+        name="Run Bars"
+    ))
+
+    # ===============================
+    # ROLLING HIGH
+    # ===============================
+
+    if "rolling_high" not in df_plot.columns:
+        df_plot["rolling_high"] = df_plot["high"].rolling(20).max()
+
+    fig.add_trace(go.Scatter(
+        x=df_plot["datetime"],
+        y=df_plot["rolling_high"].shift(1),  
+        mode="lines",
+        line=dict(
+            dash="dash",
+            width=2
+        ),
+        name="Rolling High (Resistência)"
+    ))
+
+    # ===============================
+    # ENTRADAS
+    # ===============================
+
+    fig.add_trace(go.Scatter(
+        x=df_trades["t0"],
+        y=df_trades["entry_price"],
+        mode="markers",
+        marker=dict(
+            symbol="triangle-up",
+            size=10,
+            color="green"
+        ),
+        name="Entry"
+    ))
+
+    # ===============================
+    # SAÍDAS
+    # ===============================
+
+    color_map = {
+        1: "green",
+        -1: "red",
+        0: "gray"
+    }
+
+    exit_colors = df_trades["label"].map(color_map).fillna("gray")
+
+    fig.add_trace(go.Scatter(
+        x=df_trades["t1"],
+        y=df_trades["exit_price"],
+        mode="markers",
+        marker=dict(
+            symbol="x",
+            size=8,
+            color=exit_colors
+        ),
+        name="Exit"
+    ))
+
+    # ===============================
+    # LINHAS ENTRY → EXIT
+    # ===============================
+
+    for _, row in df_trades.iterrows():
+
+        if pd.isna(row["t0"]) or pd.isna(row["t1"]):
+            continue
+
+        fig.add_trace(go.Scatter(
+            x=[row["t0"], row["t1"]],
+            y=[row["entry_price"], row["exit_price"]],
+            mode="lines",
+            line=dict(
+                color="rgba(200,200,200,0.3)",
+                width=1
+            ),
+            showlegend=False
+        ))
+
+    # ===============================
+    # LAYOUT
+    # ===============================
+
+    fig.update_layout(
+        title=f"Últimos {len(df_trades)} Trades",
+        template="plotly_dark",
+        xaxis_rangeslider_visible=False,
+        height=700
+    )
+
+    fig.show()
+
+def plot_existing_dataset(file):
+    print("Plotting existing dataset...")
+    df = pd.read_csv(file)
+
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df["t0"] = pd.to_datetime(df["t0"])
+    df["t1"] = pd.to_datetime(df["t1"])
+
+    plot_last_trades(df, n_trades=100)
+
+
+# =========================================
 # MAIN
-# ===============================
+# =========================================
 
 def main():
 
-    print("Loading feature files...")
-    run_df, feature_dfs = load_all_feature_files(DATA_FOLDER)
+    print("Loading data...")
+    dfs = load_data(DATA_FOLDER)
 
-    if run_df is None:
-        raise ValueError("Run bars file not found.")
+    print("Preparing run bars...")
+    run_df = dfs[RUN_FILE].copy()
+    #run_df = run_df.iloc[0:10000]  # limitar para teste rápido
+
+    # remover duplicados
+    run_df = run_df.sort_values("datetime")
+    run_df = run_df.drop_duplicates("datetime").reset_index(drop=True)
 
     print("Merging features...")
-    merged = merge_features(run_df, feature_dfs)
-    print(len(merged.columns))
+    merged = merge_features(run_df, dfs)
 
     print("Building events...")
     events = build_events(merged)
 
     print("Applying triple barrier...")
-    events = triple_barrier_adaptive(
-        merged,
-        events,
-        PT_MULT,
-        SL_MULT,
-        MAX_HORIZON,
-        MIN_PROB
-    )
+    events = triple_barrier(merged, events)
 
-    print("Merging dataset...")
-    final_df = pd.merge(
-        merged,
-        events,
-        left_on="datetime",
-        right_on="t0",
+    print("Final dataset...")
+    final = merged.copy()
+
+    # merge correto usando index do evento
+    final = final.merge(
+        events[[
+            "index",
+            "t0",
+            "entry_price",
+            "label",
+            "exit_price",
+            "exit_index",
+            "t1"
+        ]],
+        left_index=True,
+        right_on="index",
         how="left"
     )
 
-    print("Saving output...")
-    final_df.to_csv(OUTPUT_FILE, index=False)
+    # sanity check
+    assert final["datetime"].is_unique, "Duplicated timestamps detected!"
 
-    print("Done! Saved to:", OUTPUT_FILE)
+    final.to_csv(OUTPUT_FILE, index=False)
 
+    print("Tamanho: ", len(final))
+    print("Datetime repetido: ", final["datetime"].is_unique)
+    print("Tamanho: ", final["label"].value_counts())
+
+    print("Saved:", OUTPUT_FILE)
+
+    df = final.copy()
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df["t0"] = pd.to_datetime(df["t0"])
+    df["t1"] = pd.to_datetime(df["t1"])
+
+    plot_last_trades(df, n_trades=100)
+
+
+# =========================================
 
 if __name__ == "__main__":
+    #plot_existing_dataset(OUTPUT_FILE)
     main()
