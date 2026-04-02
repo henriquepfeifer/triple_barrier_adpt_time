@@ -128,93 +128,136 @@ def build_events(df):
 # TRIPLE BARRIER
 # =========================================
 
-def triple_barrier(df, events):
+def triple_barrier(df_run, df_exec, events):
+
+    # ===============================
+    # CONFIG
+    # ===============================
+
+    PT_MULT = 2
+    SL_MULT = 1
+    TICK = 0.01
+
+    # ===============================
+    # PREPARAÇÃO
+    # ===============================
+
+    df_run = df_run.sort_values("datetime").reset_index(drop=True)
+    df_exec = df_exec.sort_values("datetime").reset_index(drop=True)
+
+    df_exec["datetime"] = pd.to_datetime(df_exec["datetime"])
+    df_run["datetime"] = pd.to_datetime(df_run["datetime"])
+    events["t0"] = pd.to_datetime(events["t0"])
+
+    # 🔥 base temporal consistente
+    run_bar_dt = df_run["datetime"].diff().median()
 
     labels = []
     exit_prices = []
-    exit_indices = []
     exit_times = []
+    exit_indices = []
 
     # ===============================
-    # GARANTIR VOLATILIDADE
+    # LOOP EVENTOS
     # ===============================
-
-    if "volatility" not in df.columns:
-        df["volatility"] = df["close"].pct_change().rolling(20).std()
 
     for _, ev in events.iterrows():
 
-        idx = int(ev["index"])
+        t0 = ev["t0"]
+
+        # proteção
+        if pd.isna(t0):
+            labels.append(np.nan)
+            exit_prices.append(np.nan)
+            exit_times.append(pd.NaT)
+            exit_indices.append(np.nan)
+            continue
+
         entry_price = ev["entry_price"]
 
-        # proteção contra NaN / zero
-        vol = df.loc[idx, "volatility"]
-        if pd.isna(vol) or vol <= 0:
-            vol = 1e-4
+        # volatilidade
+        vol = ev["volatility_10"] if "volatility_10" in ev else 0.001
+        if not np.isfinite(vol) or vol <= 0:
+            vol = 0.001
 
-        # ===============================
-        # DEFINIÇÃO DAS BARREIRAS
-        # ===============================
-
+        # barreiras
         pt = entry_price * (1 + PT_MULT * vol)
         sl = entry_price * (1 - SL_MULT * vol)
 
+        # horizonte em TEMPO (não barras)
+        max_hold = int(np.clip(1 / vol, 5, 200))
+        t1_limit = t0 + max_hold * run_bar_dt
+
+        # ===============================
+        # LOOP EXECUÇÃO (df_exec)
+        # ===============================
+
+        df_future = df_exec[df_exec["datetime"] > t0]
+
         label = 0
-        exit_index = None
         exit_price = entry_price
+        exit_time = t0
+        exit_index = None
 
-        # ===============================
-        # LOOP FUTURO
-        # ===============================
+        for i, bar in df_future.iterrows():
 
-        for j in range(1, MAX_HORIZON + 1):
-
-            i_exit = idx + j
-
-            if i_exit >= len(df):
-                break
-
-            high = df.loc[i_exit, "high"]
-            low = df.loc[i_exit, "low"]
+            current_time = bar["datetime"]
+            high = bar["high"]
+            low = bar["low"]
 
             # ===============================
-            # TAKE PROFIT (usa HIGH)
+            # TAKE PROFIT
             # ===============================
-
             if high >= pt:
                 label = 1
-                exit_index = i_exit
-                exit_price = df.loc[i_exit, "open"]
+                exit_price = pt
+                exit_time = current_time
+                exit_index = i
                 break
 
             # ===============================
-            # STOP LOSS (usa LOW)
+            # STOP LOSS
             # ===============================
-
             if low <= sl:
                 label = -1
-                exit_index = i_exit
-                exit_price = df.loc[i_exit, "open"]
+                exit_price = sl
+                exit_time = current_time
+                exit_index = i
                 break
 
-        # ===============================
-        # FALLBACK (TIME BARRIER)
-        # ===============================
+            # ===============================
+            # TEMPO
+            # ===============================
+            if current_time >= t1_limit:
+                label = 0
+                exit_price = bar["close"]
+                exit_time = current_time
+                exit_index = i
+                break
 
-        if exit_index is None:
-            exit_index = min(idx + MAX_HORIZON, len(df) - 1)
-            exit_price = df.loc[exit_index, "open"]
+        # fallback (caso não encontre nada)
+        if exit_index is None and len(df_future) > 0:
+            last_bar = df_future.iloc[-1]
+            exit_price = last_bar["close"]
+            exit_time = last_bar["datetime"]
+            exit_index = df_future.index[-1]
             label = 0
 
         labels.append(label)
         exit_prices.append(exit_price)
+        exit_times.append(exit_time)
         exit_indices.append(exit_index)
-        exit_times.append(df.loc[exit_index, "datetime"])
+
+    # ===============================
+    # OUTPUT
+    # ===============================
+
+    events = events.copy()
 
     events["label"] = labels
     events["exit_price"] = exit_prices
-    events["exit_index"] = exit_indices
     events["t1"] = exit_times
+    events["exit_index"] = exit_indices
 
     return events
 
