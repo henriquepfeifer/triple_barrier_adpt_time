@@ -9,6 +9,7 @@ import plotly.graph_objects as go
 
 DATA_FOLDER = "full_features"
 RUN_FILE = "BTCUSDT_run_bars_features.csv"
+EXEC_FILE = "BTCUSDT_M1_2022-2025.csv"
 
 PT_MULT = 1.5
 SL_MULT = 1.0
@@ -37,6 +38,14 @@ def load_data(folder):
         dfs[f] = df
 
     return dfs
+
+def load_exec(file):
+    df = pd.read_csv(file)
+
+    df["datetime"] = pd.to_datetime(df["datetime"], format="mixed")
+    df = df.sort_values("datetime")
+
+    return df
 
 
 # =========================================
@@ -435,6 +444,13 @@ def main():
     print("Loading data...")
     dfs = load_data(DATA_FOLDER)
 
+    df_m1 = pd.read_csv("BTCUSDT_M1_2022-2025.csv")
+
+    df_m1["datetime"] = pd.to_datetime(df_m1["datetime"])
+    df_m1 = df_m1.sort_values("datetime").reset_index(drop=True)
+
+    df_m1.set_index("datetime", inplace=True)
+
     print("Preparing run bars...")
     run_df = dfs[RUN_FILE].copy()
     #run_df = run_df.iloc[0:10000]  # limitar para teste rápido
@@ -448,6 +464,8 @@ def main():
 
     print("Building events...")
     events = build_events(merged)
+
+    df_exec = load_exec(EXEC_FILE)
 
     print("Applying triple barrier...")
     events = triple_barrier(merged, events)
